@@ -725,6 +725,9 @@ class PipePredictor(object):
         object_in_region_info = {
         }  # store info for vehicle parking in region
         illegal_parking_dict = None
+        illegal_recorded_ids = set(
+        )  # track_ids already captured, ensure each illegal vehicle is snapshotted once
+        snapshot_name = self.file_name if self.file_name is not None else 'output'
         cars_count = 0
         retrograde_traj_len = 0
         framequeue = queue.Queue(10)
@@ -796,6 +799,11 @@ class PipePredictor(object):
                         for key, value in illegal_parking_dict.items():
                             plate = self.collector.get_carlp(key)
                             illegal_parking_dict[key]['plate'] = plate
+                        # save a snapshot of the frame when a new illegal
+                        # parking vehicle is detected (once per vehicle)
+                        self.save_illegal_parking_snapshot(
+                            frame_rgb, illegal_parking_dict,
+                            illegal_recorded_ids, frame_id, snapshot_name)
 
                 # nothing detected
                 if len(mot_res['boxes']) == 0:
@@ -1092,6 +1100,41 @@ class PipePredictor(object):
         if self.cfg['visual'] and len(self.pushurl) == 0:
             writer.release()
             print('save result to {}'.format(out_path))
+
+    def save_illegal_parking_snapshot(self, frame_rgb, illegal_parking_dict,
+                                      recorded_ids, frame_id, snapshot_name):
+        # find newly-appeared illegal parking vehicles in this frame
+        new_ids = [
+            tid for tid in illegal_parking_dict if tid not in recorded_ids
+        ]
+        if len(new_ids) == 0:
+            return
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        img = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)  # RGB -> BGR
+        # only annotate illegal parking vehicles, style matches
+        # deploy/pipeline/pptracking/python/mot/visualize.py
+        for tid in illegal_parking_dict:
+            x1, y1, w, h = illegal_parking_dict[tid]['bbox']
+            plate = illegal_parking_dict[tid].get('plate') or ""
+            cv2.rectangle(img, (int(x1), int(y1)),
+                          (int(x1 + w), int(y1 + h)), (0, 0, 255), 2)
+            cv2.putText(
+                img,
+                plate, (int(x1) + 5, int(y1) + 25),
+                cv2.FONT_ITALIC,
+                1.0, (0, 0, 255),
+                thickness=2)
+        ids_str = "_".join(str(i) for i in new_ids)
+        out_path = os.path.join(
+            self.output_dir, "{}_illegal_frame{}_id{}.jpg".format(
+                snapshot_name, frame_id, ids_str))
+        cv2.imwrite(out_path, img)
+        for tid in new_ids:
+            recorded_ids.add(tid)
+        plates_str = "、".join(illegal_parking_dict[tid].get('plate') or "未知"
+                              for tid in new_ids)
+        print("检测到违停车辆，车牌号：{}，截图已保存至：{}".format(plates_str, out_path))
 
     def visualize_video(self,
                         image_rgb,
