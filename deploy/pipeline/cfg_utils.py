@@ -166,6 +166,14 @@ def argsparser():
         default=2,
         help="The seconds interval to count after tracking")
     parser.add_argument(
+        "--frame_sample_interval",
+        type=int,
+        default=0,
+        help="Sample one frame every N seconds for processing (speedup). "
+        "0 means no frame sampling (process every frame, original behavior). "
+        "Only takes effect for video input; recommended with illegal parking "
+        "detection on static-camera videos.")
+    parser.add_argument(
         "--draw_center_traj",
         action='store_true',
         help="Whether drawing the trajectory of center")

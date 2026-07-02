@@ -13,6 +13,10 @@
 # limitations under the License.
 
 import os
+# quiet down FFmpeg/HEVC decoder spam ("Could not find ref with POC ...",
+# "PPS id out of range") from NVR-segmented H.265 streams. Must be set before
+# cv2 (and its FFmpeg backend) is imported. Show only fatal-level messages.
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
 import yaml
 import glob
 import cv2
@@ -21,9 +25,11 @@ import math
 import paddle
 import sys
 import copy
+import json
 import threading
 import queue
 import time
+from tqdm import tqdm
 from collections import defaultdict
 from datacollector import DataCollector, Result
 try:
@@ -77,6 +83,10 @@ class Pipeline(object):
 
     def __init__(self, args, cfg):
         self.multi_camera = False
+        # sequential_batch: process every video in a folder one by one and
+        # archive each video's results into its own sub-directory (used for
+        # illegal parking batch analysis on static-camera videos).
+        self.sequential_batch = False
         reid_cfg = cfg.get('REID', False)
         self.enable_mtmct = reid_cfg['enable'] if reid_cfg else False
         self.is_video = False
@@ -95,7 +105,9 @@ class Pipeline(object):
 
         else:
             self.predictor = PipePredictor(args, cfg, self.is_video)
-            if self.is_video:
+            # in sequential_batch mode self.input is a list of videos and the
+            # file name is set per-video inside run()
+            if self.is_video and not self.sequential_batch:
                 self.predictor.set_file_name(self.input)
 
     def _parse_input(self, image_file, image_dir, video_file, video_dir,
@@ -117,13 +129,24 @@ class Pipeline(object):
             self.is_video = True
 
         elif video_dir is not None:
-            videof = [os.path.join(video_dir, x) for x in os.listdir(video_dir)]
-            if len(videof) > 1:
+            video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv',
+                          '.m4v', '.mpg', '.mpeg')
+            videof = [
+                os.path.join(video_dir, x) for x in os.listdir(video_dir)
+                if x.lower().endswith(video_exts)
+            ]
+            videof.sort()
+            assert len(videof) > 0, \
+                "No video file found in video_dir: {}".format(video_dir)
+            if len(videof) > 1 and self.enable_mtmct:
+                # multiple cameras for multi-target multi-camera tracking
                 self.multi_camera = True
-                videof.sort()
                 input = videof
             else:
-                input = videof[0]
+                # process videos one by one, each archived into its own
+                # output sub-directory (output/<video_name>/)
+                self.sequential_batch = True
+                input = videof
             self.is_video = True
 
         elif rtsp is not None:
@@ -148,7 +171,26 @@ class Pipeline(object):
 
         return input
 
+    def _run_sequential_batch(self):
+        # process each video in the folder one by one, reusing the same
+        # predictor (models are loaded once) but archiving each video's
+        # results into output_dir/<video_name>/ and resetting per-video state.
+        base_output_dir = self.output_dir
+        for video_file in self.input:
+            video_name = os.path.split(video_file)[-1]
+            if "." in video_name:
+                video_name = ".".join(video_name.split(".")[:-1])
+            print("\n==== Processing video: {} ====".format(video_file))
+            self.predictor.output_dir = os.path.join(base_output_dir,
+                                                      video_name)
+            self.predictor.set_file_name(video_file)
+            self.predictor.reset_state()
+            self.predictor.run(video_file)
+
     def run_multithreads(self):
+        if self.sequential_batch:
+            self._run_sequential_batch()
+            return
         if self.multi_camera:
             multi_res = []
             threads = []
@@ -179,6 +221,9 @@ class Pipeline(object):
             self.predictor.run(self.input)
 
     def run(self):
+        if self.sequential_batch:
+            self._run_sequential_batch()
+            return
         if self.multi_camera:
             multi_res = []
             for predictor, input in zip(self.predictor, self.input):
@@ -357,6 +402,7 @@ class PipePredictor(object):
         self.region_type = args.region_type
         self.region_polygon = args.region_polygon
         self.illegal_parking_time = args.illegal_parking_time
+        self.frame_sample_interval = getattr(args, 'frame_sample_interval', 0)
 
         self.warmup_frame = self.cfg['warmup_frame']
         self.pipeline_res = Result()
@@ -528,6 +574,19 @@ class PipePredictor(object):
     def get_result(self):
         return self.collector.get_res()
 
+    def reset_state(self):
+        # reset per-video accumulators so results do not leak across videos
+        # when the same predictor is reused for a folder of videos.
+        self.collector = DataCollector()
+        self.pipeline_res = Result()
+        self.pipe_timer = PipeTimer()
+        # best-effort tracker reset (only some trackers expose reset())
+        if hasattr(self, 'mot_predictor') and hasattr(self.mot_predictor,
+                                                      'tracker'):
+            tracker = self.mot_predictor.tracker
+            if hasattr(tracker, 'reset'):
+                tracker.reset()
+
     def run(self, input, thread_idx=0):
         if self.is_video:
             self.predict_video(input, thread_idx=thread_idx)
@@ -637,8 +696,14 @@ class PipePredictor(object):
             if self.cfg['visual']:
                 self.visualize_image(batch_file, batch_input, self.pipeline_res)
 
-    def capturevideo(self, capture, queue):
-        frame_id = 0
+    def capturevideo(self, capture, queue, stride=1):
+        # enqueue (real_frame_id, frame_rgb). When stride > 1, sample one frame
+        # every `stride` frames by reading it and then grab()-ing over the ones
+        # in between. We read sequentially (never seek) so the decoder keeps a
+        # consistent reference-frame state: seeking with CAP_PROP_POS_FRAMES
+        # corrupts long-GOP streams such as HEVC/H.265 ("Could not find ref
+        # with POC ...") and returns no/garbage frames.
+        real_frame_id = 0
         while (1):
             if queue.full():
                 time.sleep(0.1)
@@ -647,7 +712,13 @@ class PipePredictor(object):
                 if not ret:
                     return
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                queue.put(frame_rgb)
+                queue.put((real_frame_id, frame_rgb))
+                real_frame_id += 1
+                # skip (stride - 1) frames without decoding to RGB
+                for _ in range(stride - 1):
+                    if not capture.grab():
+                        return
+                    real_frame_id += 1
 
     def predict_video(self, video_file, thread_idx=0):
         # mot
@@ -660,7 +731,34 @@ class PipePredictor(object):
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(capture.get(cv2.CAP_PROP_FPS))
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        # NVR-segmented streams often report a bogus frame_count metadata; probe
+        # the real end position by seeking to the end ratio (no decoding), then
+        # reopen so processing starts cleanly from the first frame.
+        capture.set(cv2.CAP_PROP_POS_AVI_RATIO, 1.0)
+        real_frame_count = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
+        if 0 < real_frame_count < frame_count:
+            frame_count = real_frame_count
+        capture.release()
+        capture = cv2.VideoCapture(video_file)
+        print("video width: %d, height: %d" % (width, height))
         print("video fps: %d, frame_count: %d" % (fps, frame_count))
+
+        # frame sampling: process one frame every `frame_sample_interval`
+        # seconds to speed up long-video analysis. 0 keeps original behavior.
+        sampling = self.frame_sample_interval > 0
+        if sampling and fps <= 0:
+            fps = 25  # fallback when the container reports an invalid fps
+        stride = max(1, int(round(fps * self.frame_sample_interval))) \
+            if sampling else 1
+        total_samples = int(math.ceil(frame_count / stride)) \
+            if frame_count > 0 else 0
+        if sampling:
+            print("frame sampling enabled: 1 frame every %d s (stride=%d "
+                  "frames), about %d frames to process" %
+                  (self.frame_sample_interval, stride, total_samples))
+        # do not write the annotated video when sampling (frames are sparse);
+        # only snapshots and a report are produced in that mode.
+        do_visual = self.cfg['visual'] and not sampling
 
         if len(self.pushurl) > 0:
             video_out_name = 'output' if self.file_name is None else self.file_name
@@ -668,7 +766,7 @@ class PipePredictor(object):
             print("the result will push stream to url:{}".format(pushurl))
             pushstream = PushStream(pushurl)
             pushstream.initcmd(fps, width, height)
-        elif self.cfg['visual']:
+        elif do_visual:
             video_out_name = 'output' if (
                 self.file_name is None or
                 type(self.file_name) == int) else self.file_name
@@ -692,27 +790,37 @@ class PipePredictor(object):
         out_id_list = list()
         prev_center = dict()
         records = list()
+        # use per-video local region settings so batch mode with videos of
+        # different resolutions does not reuse a previously computed polygon.
+        cur_region_type = self.region_type
+        cur_region_polygon = self.region_polygon
+        if self.illegal_parking_time != -1 and len(cur_region_polygon) == 0:
+            # default the illegal-parking region to the whole frame
+            cur_region_type = 'custom'
+            cur_region_polygon = [0, 0, width, 0, width, height, 0, height]
+            print("illegal parking region defaults to the whole frame: "
+                  "{}".format(cur_region_polygon))
         if self.do_entrance_counting or self.do_break_in_counting or self.illegal_parking_time != -1:
-            if self.region_type == 'horizontal':
+            if cur_region_type == 'horizontal':
                 entrance = [0, height / 2., width, height / 2.]
-            elif self.region_type == 'vertical':
+            elif cur_region_type == 'vertical':
                 entrance = [width / 2, 0., width / 2, height]
-            elif self.region_type == 'custom':
+            elif cur_region_type == 'custom':
                 entrance = []
                 assert len(
-                    self.region_polygon
+                    cur_region_polygon
                 ) % 2 == 0, "region_polygon should be pairs of coords points when do break_in counting."
                 assert len(
-                    self.region_polygon
+                    cur_region_polygon
                 ) > 6, 'region_type is custom, region_polygon should be at least 3 pairs of point coords.'
 
-                for i in range(0, len(self.region_polygon), 2):
+                for i in range(0, len(cur_region_polygon), 2):
                     entrance.append(
-                        [self.region_polygon[i], self.region_polygon[i + 1]])
+                        [cur_region_polygon[i], cur_region_polygon[i + 1]])
                 entrance.append([width, height])
             else:
                 raise ValueError("region_type:{} unsupported.".format(
-                    self.region_type))
+                    cur_region_type))
 
         video_fps = fps
 
@@ -727,21 +835,39 @@ class PipePredictor(object):
         illegal_parking_dict = None
         illegal_recorded_ids = set(
         )  # track_ids already captured, ensure each illegal vehicle is snapshotted once
+        illegal_records = []  # detailed records for the per-video report
+        last_real_frame_id = 0  # true index of the last processed frame
         snapshot_name = self.file_name if self.file_name is not None else 'output'
         cars_count = 0
         retrograde_traj_len = 0
         framequeue = queue.Queue(10)
 
         thread = threading.Thread(
-            target=self.capturevideo, args=(capture, framequeue))
+            target=self.capturevideo, args=(capture, framequeue, stride))
         thread.start()
-        time.sleep(1)
 
-        while (not framequeue.empty()):
-            if frame_id % 10 == 0:
+        pbar = tqdm(
+            total=total_samples if total_samples > 0 else None,
+            desc="Processing {}".format(snapshot_name),
+            unit="frame")
+
+        # keep consuming while the capture thread is still producing or the
+        # queue still has frames; a blocking get with timeout avoids the race
+        # where a slow producer (e.g. HEVC frame skipping) momentarily empties
+        # the queue and causes premature exit.
+        while thread.is_alive() or not framequeue.empty():
+            if not sampling and frame_id % 10 == 0:
                 print('Thread: {}; frame id: {}'.format(thread_idx, frame_id))
 
-            frame_rgb = framequeue.get()
+            # real_frame_id is the true frame index in the video and is used
+            # for time-based logic (parking duration = frames / fps); frame_id
+            # is the sample counter used for warmup/visualization gating.
+            try:
+                real_frame_id, frame_rgb = framequeue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            last_real_frame_id = real_frame_id
+            pbar.update(1)
             if frame_id > self.warmup_frame:
                 self.pipe_timer.total_time.start()
 
@@ -765,20 +891,22 @@ class PipePredictor(object):
                     self.pipe_timer.module_time['mot'].end()
                     self.pipe_timer.track_num += len(mot_res['boxes'])
 
-                if frame_id % 10 == 0:
+                if not sampling and frame_id % 10 == 0:
                     print("Thread: {}; trackid number: {}".format(
                         thread_idx, len(mot_res['boxes'])))
 
-                # flow_statistic only support single class MOT
+                # flow_statistic only support single class MOT.
+                # feed the real frame index so time-based counting/parking
+                # duration ((end-start)/fps) stays correct under sampling.
                 boxes, scores, ids = res[0]  # batch size = 1 in MOT
-                mot_result = (frame_id + 1, boxes[0], scores[0],
+                mot_result = (real_frame_id + 1, boxes[0], scores[0],
                               ids[0])  # single class
                 statistic = flow_statistic(
                     mot_result,
                     self.secs_interval,
                     self.do_entrance_counting,
                     self.do_break_in_counting,
-                    self.region_type,
+                    cur_region_type,
                     video_fps,
                     entrance,
                     id_set,
@@ -792,7 +920,7 @@ class PipePredictor(object):
 
                 if self.illegal_parking_time != -1:
                     object_in_region_info, illegal_parking_dict = update_object_info(
-                        object_in_region_info, mot_result, self.region_type,
+                        object_in_region_info, mot_result, cur_region_type,
                         entrance, video_fps, self.illegal_parking_time)
                     if len(illegal_parking_dict) != 0:
                         # build relationship between id and plate
@@ -801,9 +929,11 @@ class PipePredictor(object):
                             illegal_parking_dict[key]['plate'] = plate
                         # save a snapshot of the frame when a new illegal
                         # parking vehicle is detected (once per vehicle)
-                        self.save_illegal_parking_snapshot(
+                        new_records = self.save_illegal_parking_snapshot(
                             frame_rgb, illegal_parking_dict,
-                            illegal_recorded_ids, frame_id, snapshot_name)
+                            illegal_recorded_ids, real_frame_id, snapshot_name,
+                            video_fps)
+                        illegal_records.extend(new_records)
 
                 # nothing detected
                 if len(mot_res['boxes']) == 0:
@@ -811,7 +941,7 @@ class PipePredictor(object):
                     if frame_id > self.warmup_frame:
                         self.pipe_timer.img_num += 1
                         self.pipe_timer.total_time.end()
-                    if self.cfg['visual']:
+                    if do_visual:
                         _, _, fps = self.pipe_timer.get_total_time()
                         im = self.visualize_video(
                             frame_rgb, mot_res, self.collector, frame_id, fps,
@@ -830,7 +960,7 @@ class PipePredictor(object):
                 crop_input, new_bboxes, ori_bboxes = crop_image_with_mot(
                     frame_rgb, mot_res)
 
-                if self.with_vehicleplate and frame_id % 10 == 0:
+                if self.with_vehicleplate and (sampling or frame_id % 10 == 0):
                     if frame_id > self.warmup_frame:
                         self.pipe_timer.module_time['vehicleplate'].start()
                     plate_input, _, _ = crop_image_with_mot(
@@ -1080,7 +1210,7 @@ class PipePredictor(object):
                 self.pipe_timer.total_time.end()
             frame_id += 1
 
-            if self.cfg['visual']:
+            if do_visual:
                 _, _, fps = self.pipe_timer.get_total_time()
 
                 im = self.visualize_video(frame_rgb, self.pipeline_res,
@@ -1097,18 +1227,72 @@ class PipePredictor(object):
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
 
-        if self.cfg['visual'] and len(self.pushurl) == 0:
+        pbar.close()
+        if do_visual and len(self.pushurl) == 0:
             writer.release()
             print('save result to {}'.format(out_path))
 
+        if self.illegal_parking_time != -1:
+            self.save_illegal_parking_report(
+                illegal_records, video_file, width, height, video_fps,
+                last_real_frame_id, snapshot_name)
+
+    def save_illegal_parking_report(self, illegal_records, video_file, width,
+                                    height, fps, last_frame_id, snapshot_name):
+        # write a per-video summary report of detected illegal parking vehicles.
+        # duration is derived from the last processed frame index because the
+        # container's frame_count metadata is unreliable for NVR segments.
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        frame_count = last_frame_id + 1
+        duration = frame_count / fps if fps > 0 else 0
+        report = {
+            "video_file": video_file,
+            "resolution": "{}x{}".format(width, height),
+            "fps": fps,
+            "processed_frame_span": frame_count,
+            "duration": self._format_timestamp(duration),
+            "frame_sample_interval_sec": self.frame_sample_interval,
+            "illegal_parking_time_sec": self.illegal_parking_time,
+            "illegal_vehicle_count": len(illegal_records),
+            "illegal_vehicles": illegal_records,
+        }
+        json_path = os.path.join(self.output_dir, "report.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+        txt_path = os.path.join(self.output_dir, "report.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("视频文件: {}\n".format(video_file))
+            f.write("分辨率: {}x{}  帧率: {}fps  时长: {}\n".format(
+                width, height, fps, report["duration"]))
+            f.write("采样间隔: {}秒  违停时间阈值: {}秒\n".format(
+                self.frame_sample_interval, self.illegal_parking_time))
+            f.write("检测到违停车辆数: {}\n".format(len(illegal_records)))
+            f.write("-" * 40 + "\n")
+            for r in illegal_records:
+                f.write("track_id={}  车牌={}  首次判定时间={}  抓拍={}\n".format(
+                    r["track_id"], r["plate"] or "未知", r["time"],
+                    os.path.basename(r["snapshot"])))
+        print("违停报告已保存至: {} 和 {}".format(json_path, txt_path))
+
+    @staticmethod
+    def _format_timestamp(seconds):
+        seconds = int(seconds)
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        return "{:02d}:{:02d}:{:02d}".format(h, m, s)
+
     def save_illegal_parking_snapshot(self, frame_rgb, illegal_parking_dict,
-                                      recorded_ids, frame_id, snapshot_name):
+                                      recorded_ids, frame_id, snapshot_name,
+                                      fps=1):
         # find newly-appeared illegal parking vehicles in this frame
         new_ids = [
             tid for tid in illegal_parking_dict if tid not in recorded_ids
         ]
         if len(new_ids) == 0:
-            return
+            return []
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
         img = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)  # RGB -> BGR
@@ -1135,6 +1319,19 @@ class PipePredictor(object):
         plates_str = "、".join(illegal_parking_dict[tid].get('plate') or "未知"
                               for tid in new_ids)
         print("检测到违停车辆，车牌号：{}，截图已保存至：{}".format(plates_str, out_path))
+
+        # build report records for the newly-captured vehicles
+        timestamp = self._format_timestamp(frame_id / fps if fps > 0 else 0)
+        new_records = []
+        for tid in new_ids:
+            new_records.append({
+                "track_id": int(tid),
+                "plate": illegal_parking_dict[tid].get('plate') or "",
+                "frame_id": int(frame_id),
+                "time": timestamp,
+                "snapshot": out_path,
+            })
+        return new_records
 
     def visualize_video(self,
                         image_rgb,

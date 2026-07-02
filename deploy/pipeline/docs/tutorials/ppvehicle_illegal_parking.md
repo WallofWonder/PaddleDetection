@@ -66,6 +66,35 @@ python deploy/pipeline/pipeline.py --config deploy/pipeline/config/examples/infe
  快速画出想要的区域的小技巧：先任意取点得到图片，用画图工具打开，鼠标放到想要的区域点上会显示出坐标，记录下来并取整，作为这段可视化代码的region_polygon参数，并再次运行可视化，微调点坐标参数直至满意。
 
 
+### 批量处理文件夹 + 全画面禁停区 + 跳帧加速（推荐用于停车排污等长视频排查）
+
+针对固定机位的长时间监控视频，支持一次性遍历整个文件夹、逐个视频独立归档，并自动把禁停区设为整幅画面、按固定时间间隔跳帧加速。启动命令如下：
+
+```python
+python deploy/pipeline/pipeline.py --config deploy/pipeline/config/examples/infer_cfg_illegal_parking.yml \
+                                                   --video_dir=/path/to/videos \
+                                                   --device=gpu \
+                                                   --illegal_parking_time=300 \
+                                                   --frame_sample_interval=60 \
+                                                   --output_dir=output
+```
+
+新增/相关参数说明：
+- `video_dir`：视频文件夹路径。当文件夹内有多个视频且未开启 MTMCT（REID）时，会**逐个顺序处理**，每个视频的结果保存到 `output/<视频名>/` 独立子目录中；
+- `frame_sample_interval`：跳帧采样间隔，单位为秒，默认 `0`（不跳帧，逐帧处理，保持原行为）。设为 `60` 表示每分钟处理 1 帧，大幅加速长视频处理；
+- `illegal_parking_time`：违停时间阈值，单位为秒。用于排查停车排污车辆时，推荐设为 `300`（5 分钟）——临时停靠一般不超过 2 分钟，排污作业通常持续 5 分钟以上；
+- 若**未提供** `--region_polygon`，且开启了违停识别（`illegal_parking_time != -1`），禁停区会**自动设置为整幅画面**，无需再手动画多边形。
+
+每个视频子目录的输出：
+- 违章抓拍图 `*_illegal_frame*_id*.jpg`（每辆违停车只抓拍一次，红框标注车牌）；
+- `report.json` / `report.txt`：包含视频路径、分辨率、帧率、时长、采样间隔、阈值，以及命中车辆的 track_id、车牌、首次判定时间戳、抓拍图路径。
+
+处理过程会用 `tqdm` 显示每个视频的进度条。采样模式（`frame_sample_interval>0`）下**不再输出完整标注视频**，仅保存抓拍图与报告。
+
+**注意：**
+- 该模式依赖跟踪 ID 在采样点之间保持连续，因此**仅适用于固定机位、镜头不抖动、检测长时间静止（停放）车辆**的场景；行驶车辆不受影响（不会误判）。
+- 跳帧间隔越大处理越快，但时间判定粒度越粗（只能按采样间隔的倍数判断停车时长）；如需更稳健的跟踪，可把 `frame_sample_interval` 调小（如 5~10 秒）。
+
 3. 若修改模型路径，有以下两种方式：
 
     - 方法一：```./deploy/pipeline/config/examples/infer_cfg_illegal_parking.yml```下可以配置不同模型路径；
